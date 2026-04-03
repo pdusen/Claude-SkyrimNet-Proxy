@@ -171,8 +171,8 @@ async def interceptor_handler(request):
                     headers={"Content-Type": resp.headers.get("Content-Type", "application/json")},
                 )
 
-    # Capture auth headers and body template
-    if not auth.is_ready:
+    # Capture auth headers and body template (skip preflight requests missing real payload)
+    if not auth.is_ready and "system" in parsed and "messages" in parsed:
         # Build template locally, then assign both fields "atomically"
         captured_headers = dict(headers)
 
