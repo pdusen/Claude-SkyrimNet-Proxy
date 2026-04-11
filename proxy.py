@@ -120,8 +120,8 @@ auth = AuthCache()
 
 # --- OpenRouter + Round-Robin state ---
 _cfg = _load_config()
-openrouter_api_key: Optional[str] = _cfg.get("openrouter_api_key") or None
-if openrouter_api_key:
+GLOBAL_OPENROUTER_API_KEY: Optional[str] = _cfg.get("openrouter_api_key") or None
+if GLOBAL_OPENROUTER_API_KEY:
     logger.info("OpenRouter API key loaded from config.json")
 _round_robin_counter: int = 0
 
@@ -489,10 +489,8 @@ async def call_api_streaming_with_retry(system_prompt: Optional[str], messages: 
 
 # --- OpenRouter API calls ---
 
-async def call_openrouter_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params) -> str:
+async def call_openrouter_direct(openrouter_api_key: str, system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params) -> str:
     """Forward request to OpenRouter (OpenAI-compatible), collect full response."""
-    if not openrouter_api_key:
-        raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
 
     oai_messages = []
     if system_prompt:
@@ -530,12 +528,8 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
             await session.close()
 
 
-async def call_openrouter_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params):
+async def call_openrouter_streaming(openrouter_api_key: str, system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params):
     """Forward request to OpenRouter with streaming, passthrough SSE directly."""
-    if not openrouter_api_key:
-        yield 'data: {"error": "OpenRouter API key not configured"}\n\n'
-        yield "data: [DONE]\n\n"
-        return
 
     oai_messages = []
     if system_prompt:
@@ -633,7 +627,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest):
+async def chat_completions(req: ChatRequest, request: Request):
     # Parse model list and pick via round-robin
     model_field = req.model or DEFAULT_MODEL
     models = parse_model_list(model_field)
@@ -667,13 +661,19 @@ async def chat_completions(req: ChatRequest):
 
     # Route to correct provider
     if use_openrouter:
+        try:
+            #Get the API key if it's stored in the webUI, else look at the headers from SkyrimNet to see if it's there. If it's not,
+            open_router_api_key = GLOBAL_OPENROUTER_API_KEY if GLOBAL_OPENROUTER_API_KEY else request.headers.get("authorization").removeprefix("Bearer ").strip()
+        except AttributeError:
+            raise HTTPException(status_code=401, detail="OpenRouter API key not configured, upload it to the WebUI or place it in the Skyrimnet API Settings")
+        
         if req.stream:
             return StreamingResponse(
-                call_openrouter_streaming(system_prompt, merged, model, max_tokens, **extra_params),
+                call_openrouter_streaming(open_router_api_key, system_prompt, merged, model, max_tokens, **extra_params),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        response = await call_openrouter_direct(system_prompt, merged, model, max_tokens, **extra_params)
+        response = await call_openrouter_direct(open_router_api_key, system_prompt, merged, model, max_tokens, **extra_params)
     else:
         # Ensure auth is available (queues behind refresh if one is in progress)
         try:
