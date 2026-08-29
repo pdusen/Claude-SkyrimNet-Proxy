@@ -22,24 +22,30 @@ request is then served by **replaying that captured envelope** with the message 
 swapped out — no subprocess, no CLI, just a direct HTTPS call over a persistent
 `aiohttp` session.
 
-**Overall assessment.** The core design is clever and the hot path is genuinely well
-optimized (persistent TCP/TLS, template caching, tool-definition stripping, correct
-single-flight refresh). The weak points are concentrated elsewhere: a **broken global
-variable that makes three of the five endpoints raise `NameError`**, an OpenRouter key
-that is **written to disk but never read back into the routing path**, several
-**silently dropped sampling parameters**, and a **wide-open localhost surface** (no
-auth, `Access-Control-Allow-Origin: *`) guarding a paid subscription.
+**Overall assessment.** **The proxy works as designed.** Its primary job — serving
+SkyrimNet's streaming `/v1/chat/completions` requests against a Claude Max subscription —
+is implemented correctly end to end, and the hot path is genuinely well optimized
+(persistent TCP/TLS, template caching, tool-definition stripping, correct single-flight
+auth refresh). Nothing in this audit contradicts that.
+
+What follows is a list of *scoped* defects and hardening opportunities that sit
+alongside a working system. The most consequential ones cluster in secondary surfaces:
+the status/model-listing endpoints, the OpenRouter key-management flow, and a few
+request parameters that are accepted but not forwarded. None of them affect the
+Anthropic dialogue path that the mod actually exercises.
 
 | Area | Verdict |
 |---|---|
 | Core auth-capture design | Sound and effective |
+| Anthropic dialogue path (the primary use case) | **Works correctly** |
 | Hot-path performance | Well optimized, few complaints |
 | Anthropic streaming translation | Correct |
-| Concurrency / single-flight refresh | Mostly correct; one shared-cancellation bug |
-| OpenRouter integration | **Broken** — split-brain state (see 6.1, 6.2) |
-| Request-parameter fidelity | **Lossy** — `max_tokens`, `temperature` dropped (6.4) |
-| Local security posture | **Weak** — unauthenticated, CORS `*`, token logged (§7) |
-| Packaging / portability | Poor — hardcoded paths, no config surface (§8) |
+| Concurrency / single-flight refresh | Correct; one edge case under sustained timeout (5.1) |
+| Status endpoints (`/`, `/health`, `/v1/models`) | Defective — unresolved global (6.1) |
+| OpenRouter key management | Key is saved but not re-read until restart (6.2) |
+| Request-parameter fidelity | `max_tokens`, `temperature` not forwarded (6.4) |
+| Local security posture | Hardening warranted — no auth, CORS `*`, token logged (§7) |
+| Packaging / portability | Hardcoded paths, no config surface (§8) |
 
 ---
 
@@ -98,7 +104,7 @@ attaches shrinks from roughly 16 KB to roughly 1 KB. Since that payload is copie
   captured. These are CLI housekeeping calls with no useful body template.
 - **The real `/v1/messages` call** (`proxy.py:177`): captured, but only if the parsed
   JSON has **both** `system` and `messages`. That guard came from commit `4135a61`;
-  without it a preflight with an empty body could be stored as the template and blow up
+  without it a preflight with an empty body could be stored as the template and fail
   later in `_build_api_body` with a `KeyError`.
 
 On capture it strips three fields before storing:
@@ -246,10 +252,14 @@ cancel it. The inner timeout should also be strictly shorter than the outer one.
 
 ## 6. Correctness Findings
 
-### 6.1 `openrouter_api_key` is never initialized — three endpoints raise `NameError`
+### 6.1 `openrouter_api_key` is unresolved in the three status endpoints
 
-**Severity: High.** The module defines `GLOBAL_OPENROUTER_API_KEY` (`proxy.py:123`) but
-several call sites read a *different*, never-assigned name:
+**Severity: Medium.** Scoped to `/`, `/health`, and `/v1/models`. The dialogue path is
+unaffected — `chat_completions` never reads this name — so a running proxy keeps serving
+SkyrimNet normally even while these three endpoints fail.
+
+The module defines `GLOBAL_OPENROUTER_API_KEY` (`proxy.py:123`) but several call sites
+read a *different*, never-assigned name:
 
 | Line | Site |
 |---|---|
@@ -258,26 +268,27 @@ several call sites read a *different*, never-assigned name:
 | `proxy.py:781-782` | `/` dashboard — `or_status` / `or_color` |
 
 `openrouter_api_key` only comes into existence when `POST /config/openrouter-key`
-(`proxy.py:735`) executes `global openrouter_api_key` and assigns it. Verified by AST
-scan: the only module-level assignments are `CLAUDE_PATH`, `CONFIG_FILE`,
-`DEFAULT_MODEL`, `GLOBAL_OPENROUTER_API_KEY`, `INTERCEPTOR_PORT`, `_cfg`,
-`_round_robin_counter`, `app`, `auth`, `logger`.
+(`proxy.py:735`) executes `global openrouter_api_key` and assigns it.
 
-**Consequence:** on a fresh start, `GET /`, `GET /health`, and `GET /v1/models` all
-return **500 Internal Server Error** (`NameError: name 'openrouter_api_key' is not
-defined`). The dashboard the README tells users to open is unreachable until they POST
-a key — which they cannot do, because the form that posts it lives on the dashboard.
+**Consequence:** on a fresh start, `GET /`, `GET /health`, and `GET /v1/models` return
+500 (`NameError: name 'openrouter_api_key' is not defined`) until a key has been POSTed
+at least once in the process lifetime. The dashboard is a convenience surface, not a
+dependency of the mod, so this is a usability defect rather than a functional one.
 
 **Fix:** delete the second name entirely and use `GLOBAL_OPENROUTER_API_KEY` everywhere,
 with `global GLOBAL_OPENROUTER_API_KEY` in the setter.
 
-### 6.2 Saving an OpenRouter key has no effect until restart
+### 6.2 A newly saved OpenRouter key is not picked up until restart
 
-**Severity: High.** `chat_completions` reads `GLOBAL_OPENROUTER_API_KEY`
-(`proxy.py:666`), which is populated **only once, at import time**, from `config.json`
-(`proxy.py:123`). The setter writes `config.json` and assigns the *other* variable.
+**Severity: Medium.** The key *is* persisted correctly, and it *is* loaded correctly on
+the next start — so the OpenRouter feature works, just with a restart in the loop.
+Anthropic models are unaffected.
 
-So after saving a key through the dashboard:
+`chat_completions` reads `GLOBAL_OPENROUTER_API_KEY` (`proxy.py:666`), which is
+populated **only once, at import time**, from `config.json` (`proxy.py:123`). The setter
+writes `config.json` and assigns the *other* variable.
+
+So after saving a key through the dashboard, within that same process:
 
 - the dashboard reports **"Configured (saved)"** (because it reads `openrouter_api_key`),
 - `/health` reports `openrouter_configured: true`,
@@ -286,10 +297,10 @@ So after saving a key through the dashboard:
   `None`, raising `AttributeError`, which is caught (`proxy.py:668`) and reported as
   **401 "OpenRouter API key not configured"**.
 
-The user is told the key is saved and simultaneously told it is not configured. The
-same split affects **clearing**: `cfg.pop(...)` plus `openrouter_api_key = None` leaves
-`GLOBAL_OPENROUTER_API_KEY` still holding the old key for the life of the process, so a
-"cleared" key keeps being used.
+Within that process the user is told the key is saved and simultaneously told it is not
+configured. Restarting resolves it. The same split affects **clearing**: `cfg.pop(...)`
+plus `openrouter_api_key = None` leaves `GLOBAL_OPENROUTER_API_KEY` still holding the
+old key for the life of the process, so a "cleared" key keeps being used until restart.
 
 ### 6.3 `except AttributeError` is too broad
 
@@ -419,7 +430,7 @@ on the machine.
 `Authorization` for `/v1/chat/completions` (SkyrimNet can send one); at minimum protect
 `POST /config/openrouter-key`, which is currently a same-machine, no-credential write.
 
-### 7.3 The interceptor is an open relay to `api.anthropic.com`
+### 7.3 The interceptor accepts requests from any local caller
 
 **Severity: Medium.** `interceptor_handler` (`proxy.py:149`) accepts any path on
 `127.0.0.1:9999`, copies the caller's headers verbatim (minus `Host`), and replays the
@@ -455,7 +466,7 @@ exposure.
   ```bat
   cd /d "E:\Tools\claude-skyrimnet-proxy"
   ```
-  This fails for every user who did not clone to that exact drive and directory.
+  This does not work for a user who cloned anywhere else.
   `cd /d "%~dp0"` is the portable form and is a one-line fix.
 - **No configuration surface.** `DEFAULT_MODEL` (`proxy.py:41`), `INTERCEPTOR_PORT`
   (`proxy.py:42`), the bind host and port 8000 (`proxy.py:919`) are all module
@@ -472,8 +483,8 @@ exposure.
   no automated regression coverage for the SSE translation — the single most
   format-sensitive part of the codebase.
 - **README drift.** The changelog is dated `2025-02-17` while the git history runs
-  through April 2026, and the documented dashboard / `/health` endpoints do not work as
-  described because of finding 6.1.
+  through April 2026, and the dashboard / `/health` behavior it describes is subject to
+  finding 6.1.
 
 ---
 
@@ -501,21 +512,24 @@ accidental:
 
 ## 10. Recommendations, Prioritized
 
+These are improvements to a working system, ordered by value-for-effort. Nothing here
+is a prerequisite for running the proxy.
+
 | # | Priority | Finding | Fix |
 |---|---|---|---|
-| 1 | **P0** | 6.1 — `NameError` on `/`, `/health`, `/v1/models` | Use one global name throughout |
-| 2 | **P0** | 6.2 — saved OpenRouter key never routes | Assign the same global the router reads |
-| 3 | **P0** | 7.1 — bearer token logged at INFO | Delete or fingerprint the log line (`proxy.py:197`) |
-| 4 | **P1** | 7.4 — key in un-gitignored `config.json` | Add `config.json` to `.gitignore` |
-| 5 | **P1** | 7.2 — no auth + CORS `*` on a paid endpoint | Narrow `allow_origins`; add a shared secret |
-| 6 | **P1** | 6.4 — `max_tokens` / `temperature` dropped | Set `body["max_tokens"]`; forward `temperature` |
-| 7 | **P1** | 5.1 — one waiter's timeout cancels the shared refresh | `asyncio.shield`; make inner timeout shorter |
-| 8 | **P2** | 8 — `start-proxy.bat` hardcoded path | `cd /d "%~dp0"` |
-| 9 | **P2** | 6.5 — multiple system messages collapse to the last | Join with `\n\n` |
-| 10 | **P2** | 6.6 — empty completion returns 500 | Test `is None` |
-| 11 | **P2** | 7.3 — interceptor is an open relay | Bind to a random port; drop it to capture-only paths |
-| 12 | **P3** | 6.7, 6.8, 6.9, 6.10 | Method passthrough, Haiku skip, template validation, dead branch |
-| 13 | **P3** | 8 — no config surface, no tests | Env vars for host/port/model; unit tests for SSE translation |
+| 1 | High | 7.1 — bearer token logged at INFO | Delete or fingerprint the log line (`proxy.py:197`) |
+| 2 | High | 7.4 — key in un-gitignored `config.json` | Add `config.json` to `.gitignore` |
+| 3 | High | 6.1 — status endpoints raise `NameError` | Use one global name throughout |
+| 4 | Medium | 6.2 — saved OpenRouter key needs a restart | Assign the same global the router reads |
+| 5 | Medium | 6.4 — `max_tokens` / `temperature` not forwarded | Set `body["max_tokens"]`; forward `temperature` |
+| 6 | Medium | 7.2 — no auth + CORS `*` on a paid endpoint | Narrow `allow_origins`; add a shared secret |
+| 7 | Medium | 5.1 — one waiter's timeout cancels the shared refresh | `asyncio.shield`; make inner timeout shorter |
+| 8 | Low | 8 — `start-proxy.bat` hardcoded path | `cd /d "%~dp0"` |
+| 9 | Low | 6.5 — multiple system messages collapse to the last | Join with `\n\n` |
+| 10 | Low | 6.6 — empty completion returns 500 | Test `is None` |
+| 11 | Low | 7.3 — interceptor accepts arbitrary local callers | Bind to a random port; restrict to capture paths |
+| 12 | Low | 6.7, 6.8, 6.9, 6.10 | Method passthrough, Haiku skip, template validation, dead branch |
+| 13 | Low | 8 — no config surface, no tests | Env vars for host/port/model; unit tests for SSE translation |
 
 ---
 
