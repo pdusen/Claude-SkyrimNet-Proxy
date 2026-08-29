@@ -786,17 +786,17 @@ async def chat_completions(req: ChatRequest, request: Request):
 
 @app.post("/config/openrouter-key")
 async def set_openrouter_key(request: Request):
-    global openrouter_api_key
+    global GLOBAL_OPENROUTER_API_KEY
     data = await request.json()
     key = data.get("key", "").strip()
     cfg = _load_config()
     if not key:
-        openrouter_api_key = None
+        GLOBAL_OPENROUTER_API_KEY = None
         cfg.pop("openrouter_api_key", None)
         _save_config(cfg)
         logger.info("OpenRouter API key cleared")
         return {"status": "cleared"}
-    openrouter_api_key = key
+    GLOBAL_OPENROUTER_API_KEY = key
     cfg["openrouter_api_key"] = key
     _save_config(cfg)
     logger.info("OpenRouter API key configured and saved to config.json")
@@ -809,7 +809,7 @@ async def list_models():
         {"id": model_id, "object": "model", "owned_by": "anthropic"}
         for model_id in ANTHROPIC_MODELS
     ]
-    if openrouter_api_key:
+    if GLOBAL_OPENROUTER_API_KEY:
         data.append({"id": "openrouter/*", "object": "model", "owned_by": "openrouter"})
     return {"object": "list", "data": data}
 
@@ -820,7 +820,7 @@ async def health():
         "status": "healthy" if auth.is_ready else "warming_up",
         "claude_path": CLAUDE_PATH,
         "auth_cached": auth.is_ready,
-        "openrouter_configured": openrouter_api_key is not None,
+        "openrouter_configured": GLOBAL_OPENROUTER_API_KEY is not None,
     }
 
 
@@ -830,8 +830,8 @@ async def dashboard():
     status_color = "#4ade80" if auth.is_ready else "#facc15"
     template_size = len(json.dumps(auth.body_template)) if auth.body_template else 0
 
-    or_status = "Configured (saved)" if openrouter_api_key else "Not set"
-    or_color = "#4ade80" if openrouter_api_key else "#64748b"
+    or_status = "Configured (saved)" if GLOBAL_OPENROUTER_API_KEY else "Not set"
+    or_color = "#4ade80" if GLOBAL_OPENROUTER_API_KEY else "#64748b"
 
     default_model_name = ANTHROPIC_MODELS.get(DEFAULT_MODEL, (DEFAULT_MODEL, ""))[0]
 
