@@ -1,51 +1,31 @@
-# Claude SkyrimNet Proxy — Architecture & Code Audit
+# Claude SkyrimNet Proxy — Architecture Reference
 
-**Audit date:** 2026-08-29
-**Subject:** `proxy.py` (919 lines, single module), `README.md`, `requirements.txt`, `start-proxy.bat`, `.gitignore`
-**Repo state:** `main` @ `2ea1a1e` (clean tree)
+**Written:** 2026-08-29
+**Subject:** `proxy.py` (919 lines, single module)
+**Repo state:** `main` @ `2ea1a1e`
+
+A description of how the proxy is put together and why it works the way it does.
 
 ---
 
-## 1. Executive Summary
+## 1. Overview
 
 `proxy.py` is a single-file FastAPI service that exposes an **OpenAI-compatible
-`/v1/chat/completions` endpoint** and satisfies it using the credentials belonging to
-a locally-installed, logged-in **Claude Code CLI**. It exists so that SkyrimNet — a
-Skyrim mod that drives NPC dialogue from an LLM — can talk to a Claude Max
-subscription instead of a metered API key.
+`/v1/chat/completions` endpoint** and satisfies it using the credentials belonging to a
+locally-installed, logged-in **Claude Code CLI**. It exists so that SkyrimNet — a Skyrim
+mod that drives NPC dialogue from an LLM — can talk to a Claude Max subscription instead
+of a metered API key. Models containing a `/` are routed to OpenRouter instead.
 
-The central trick is a **startup-time man-in-the-middle capture**. The proxy points the
-Claude CLI at a local HTTP listener via `ANTHROPIC_BASE_URL`, runs one throwaway
+The central mechanism is a **startup-time man-in-the-middle capture**. The proxy points
+the Claude CLI at a local HTTP listener via `ANTHROPIC_BASE_URL`, runs one throwaway
 `claude --print` invocation, and records both the OAuth headers and the full request
-body that the CLI would have sent to `api.anthropic.com`. Every subsequent game
-request is then served by **replaying that captured envelope** with the message array
-swapped out — no subprocess, no CLI, just a direct HTTPS call over a persistent
-`aiohttp` session.
+body that the CLI would have sent to `api.anthropic.com`. Every subsequent game request
+is then served by **replaying that captured envelope** with the message array swapped
+out — no subprocess, no CLI, just a direct HTTPS call over a persistent `aiohttp`
+session.
 
-**Overall assessment.** **The proxy works as designed.** Its primary job — serving
-SkyrimNet's streaming `/v1/chat/completions` requests against a Claude Max subscription —
-is implemented correctly end to end, and the hot path is genuinely well optimized
-(persistent TCP/TLS, template caching, tool-definition stripping, correct single-flight
-auth refresh). Nothing in this audit contradicts that.
-
-What follows is a list of *scoped* defects and hardening opportunities that sit
-alongside a working system. The most consequential ones cluster in secondary surfaces:
-the status/model-listing endpoints, the OpenRouter key-management flow, and a few
-request parameters that are accepted but not forwarded. None of them affect the
-Anthropic dialogue path that the mod actually exercises.
-
-| Area | Verdict |
-|---|---|
-| Core auth-capture design | Sound and effective |
-| Anthropic dialogue path (the primary use case) | **Works correctly** |
-| Hot-path performance | Well optimized, few complaints |
-| Anthropic streaming translation | Correct |
-| Concurrency / single-flight refresh | Correct; one edge case under sustained timeout (5.1) |
-| Status endpoints (`/`, `/health`, `/v1/models`) | Defective — unresolved global (6.1) |
-| OpenRouter key management | Key is saved but not re-read until restart (6.2) |
-| Request-parameter fidelity | `max_tokens`, `temperature` not forwarded (6.4) |
-| Local security posture | Hardening warranted — no auth, CORS `*`, token logged (§7) |
-| Packaging / portability | Hardcoded paths, no config surface (§8) |
+The result is roughly a 2 s round trip in place of the ~9 s a per-request subprocess
+would cost, which is what makes it viable for real-time NPC dialogue.
 
 ---
 
@@ -63,7 +43,7 @@ Anthropic dialogue path that the mod actually exercises.
 | 357–489 | `call_api_streaming_with_retry` | Anthropic streaming + 401 retry + SSE translation |
 | 492–586 | `call_openrouter_*` | OpenRouter passthrough (direct + streaming) |
 | 592–626 | Models & `lifespan` | Pydantic schemas, startup/shutdown wiring |
-| 629–732 | `chat_completions` | The one real endpoint: normalize → route → respond |
+| 629–732 | `chat_completions` | The main endpoint: normalize → route → respond |
 | 734–773 | `/config/openrouter-key`, `/v1/models`, `/health` | Control-plane endpoints |
 | 776–916 | `dashboard` | Server-rendered HTML+JS status page |
 
@@ -91,10 +71,10 @@ claude --print --output-format text --model <DEFAULT_MODEL>
 
 with `cwd=tmpdir` and `ANTHROPIC_BASE_URL=http://127.0.0.1:9999`.
 
-The clean `cwd` is load-bearing, not cosmetic: it means the CLI finds no `CLAUDE.md`,
-no project skills, and no repo context, so the `<system-reminder>` payload the CLI
-attaches shrinks from roughly 16 KB to roughly 1 KB. Since that payload is copied into
-**every** subsequent request, this one decision removes ~15 KB per NPC line.
+The clean `cwd` is load-bearing, not cosmetic: it means the CLI finds no `CLAUDE.md`, no
+project skills, and no repo context, so the `<system-reminder>` payload the CLI attaches
+shrinks from roughly 16 KB to roughly 1 KB. Since that payload is copied into **every**
+subsequent request, this one decision removes ~15 KB per NPC line.
 
 ### 3.2 What the interceptor keeps
 
@@ -103,9 +83,8 @@ attaches shrinks from roughly 16 KB to roughly 1 KB. Since that payload is copie
 - **Haiku warmup / `count_tokens`** (`proxy.py:166`): forwarded straight through, never
   captured. These are CLI housekeeping calls with no useful body template.
 - **The real `/v1/messages` call** (`proxy.py:177`): captured, but only if the parsed
-  JSON has **both** `system` and `messages`. That guard came from commit `4135a61`;
-  without it a preflight with an empty body could be stored as the template and fail
-  later in `_build_api_body` with a `KeyError`.
+  JSON has **both** `system` and `messages`. That guard came from commit `4135a61` and
+  keeps a preflight from being stored as the template.
 
 On capture it strips three fields before storing:
 
@@ -119,9 +98,9 @@ Both the headers and the template are assigned back-to-back (`proxy.py:194-195`)
 concurrent reader never observes a half-populated cache. Everything is then forwarded
 upstream so the CLI's own invocation still completes normally.
 
-Note the interceptor **is not shut down after capture** — its runner lives until
-`lifespan` exits (`proxy.py:623`). That is deliberate: runtime re-capture (§5) depends
-on port 9999 still listening.
+The interceptor **is not shut down after capture** — its runner lives until `lifespan`
+exits (`proxy.py:623`). That is deliberate: runtime re-capture (§5) depends on port 9999
+still listening.
 
 ---
 
@@ -130,12 +109,12 @@ on port 9999 still listening.
 ### 4.1 Normalization (`chat_completions`, `proxy.py:630`)
 
 1. **Model selection.** `req.model` is split on commas (`proxy.py:129`). With more than
-   one entry, `pick_model_round_robin` (`proxy.py:134`) advances a module-level counter —
-   rotation is *global across all callers*, not per-conversation.
+   one entry, `pick_model_round_robin` (`proxy.py:134`) advances a module-level counter,
+   so rotation is *global across all callers* rather than per-conversation.
 2. **Provider routing.** `is_openrouter_model` (`proxy.py:142`) is a bare `"/" in model`
    test. Slash means OpenRouter; anything else means Anthropic.
 3. **Role split.** `system` messages are pulled out into `system_prompt`;
-   `user`/`assistant` go into the conversation list. Any other role is dropped silently.
+   `user`/`assistant` go into the conversation list.
 4. **Shape fixes.** If the first message is not `user`, a synthetic
    `{"role": "user", "content": "Continue."}` is prepended — Anthropic requires a
    user-first alternation. Consecutive same-role messages are then merged with `\n\n`.
@@ -156,57 +135,59 @@ if system_prompt:
 Two pieces of the captured template are deliberately kept:
 
 - **`system[0]`** — the Claude Code identity/billing block. Anthropic's Max-subscription
-  endpoint appears to key off it; removing it produces the
+  endpoint keys off it; removing it produces the
   `"credential only authorized for Claude Code"` error the README documents.
 - **`<system-reminder>` text blocks** from the template's first user message
   (`proxy.py:267-274`). These are re-attached ahead of the caller's first user message.
 
-The NPC persona is therefore appended as `system[1]`, *behind* the Claude Code identity
-block. That is an inherent, structural limitation: the model is told it is Claude Code
-first and Lydia second. It largely works, but it explains any tendency to break
-character or answer meta-questions as an assistant.
+The NPC persona is appended as `system[1]`, behind the Claude Code identity block. The
+template is deep-copied per request, so concurrent requests never share mutable state.
 
 Finally `body["model"]` is overwritten with the requested model and `body["stream"]` is
 forced to `True` **on both paths** — the non-streaming endpoint streams internally and
-reassembles.
+reassembles the text before returning.
 
 ### 4.3 Streaming translation (`call_api_streaming_with_retry`, `proxy.py:357`)
 
-The generator does a genuinely correct SSE bridge:
+The generator bridges Anthropic SSE to OpenAI SSE:
 
 - Emits a leading OpenAI **role chunk** (`delta: {role: "assistant", content: ""}`),
   which several clients require before any content.
 - Reads with `resp.content.iter_any()` into a string buffer and splits on `\n`, so a
-  network chunk that lands mid-line is handled correctly rather than dropping the line.
-- Maps only `content_block_delta` → `text_delta` into OpenAI
-  `chat.completion.chunk` frames. Everything else — `message_start`, `ping`,
-  `content_block_start/stop`, `message_delta`, `thinking_delta` — is ignored.
+  network chunk that lands mid-line is reassembled rather than dropped.
+- Maps `content_block_delta` → `text_delta` into OpenAI `chat.completion.chunk` frames.
+  Other event types — `message_start`, `ping`, `content_block_start/stop`,
+  `message_delta` — are skipped.
 - Terminates with a `finish_reason: "stop"` chunk followed by `data: [DONE]`.
 
 **Retry design.** The `for attempt in range(2)` loop retries a 401/403 *only before the
-first chunk has been yielded* (`proxy.py:386-392`). This is the right call: once bytes
-are on the wire, an HTTP status cannot be retracted, so a mid-stream failure has to
-degrade rather than retry.
+first chunk has been yielded* (`proxy.py:386-392`). Once bytes are on the wire an HTTP
+status cannot be retracted, so a later failure degrades instead of retrying.
 
 **Error surfacing.** A non-retryable failure is emitted as assistant *content* —
-`"[API Error 500]"` (`proxy.py:409`). SkyrimNet will therefore have an NPC **speak the
-error string aloud in-game**. That is a defensible choice for a mod (it is visible
-without opening a console) but it is worth knowing.
+`"[API Error 500]"` (`proxy.py:409`). SkyrimNet will have an NPC speak the error string
+in-game, which surfaces problems without needing the console open.
 
 ### 4.4 OpenRouter path (`proxy.py:492-586`)
 
-Much simpler, because OpenRouter is already OpenAI-shaped. The system prompt becomes a
-normal `{"role": "system"}` message and the payload is posted with a `Bearer` key. The
-streaming variant is a **raw passthrough**: it re-frames on `\n\n` and forwards each SSE
-event verbatim, including OpenRouter's own `[DONE]`. No translation, and no `model`
-field rewriting.
+Simpler, because OpenRouter is already OpenAI-shaped. The system prompt becomes a normal
+`{"role": "system"}` message and the payload is posted with a `Bearer` key. `max_tokens`
+and any undeclared extra parameters from the request are forwarded here
+(`proxy.py:501`, `proxy.py:540`). The streaming variant is a **raw passthrough**: it
+re-frames on `\n\n` and forwards each SSE event verbatim, including OpenRouter's own
+`[DONE]`.
+
+### 4.5 Response assembly
+
+Non-streaming replies are wrapped in an OpenAI `chat.completion` envelope
+(`proxy.py:686`). `usage` counts are character-based estimates (`len(text) // 4`,
+`proxy.py:682-684`) rather than real token accounting.
 
 ---
 
 ## 5. Auth Lifecycle & Concurrency
 
-`AuthCache.ensure_ready` (`proxy.py:87`) implements a correct **single-flight** pattern,
-which is the most carefully-written part of the file:
+`AuthCache.ensure_ready` (`proxy.py:87`) implements a **single-flight** pattern:
 
 ```python
 async with self._refresh_lock:
@@ -226,314 +207,37 @@ expired token produce **exactly one** `claude --print` subprocess, and the other
 queue behind the same task. Without this, a busy scene in-game could spawn a dozen CLI
 processes at once.
 
-Expiry handling is **reactive, not proactive**. There is no TTL and no background
-refresh timer; the cache is invalidated only when the API answers 401/403 or returns a
-body containing `"credential"` (`proxy.py:322-325`, `proxy.py:402-405`). The first
-request after token expiry therefore pays the full ~5 s recapture cost, and
-non-streaming callers pay it inside their own request (`proxy.py:694-702`).
+Expiry handling is **reactive**. There is no TTL and no background refresh timer; the
+cache is invalidated when the API answers 401/403 or returns a body containing
+`"credential"` (`proxy.py:322-325`, `proxy.py:402-405`). The first request after token
+expiry pays the recapture cost, and subsequent requests reuse the refreshed headers.
 
-### 5.1 Bug — a timed-out waiter cancels the refresh for everyone
-
-`asyncio.wait_for` **cancels** the future it is waiting on when the timeout fires. Since
-every waiter shares the *same* `_refresh_task`, the first waiter to hit 60 s cancels the
-capture that all the other waiters are also depending on, and they all receive
-`CancelledError` rather than a result.
-
-This is made likely rather than theoretical by the timeout values: `capture_auth`'s own
-subprocess timeout is 60 s (`proxy.py:226`) and `ensure_ready`'s default is also 60 s
-(`proxy.py:87`). A genuinely slow CLI start means the outer timer, armed slightly
-earlier by whichever request arrived first, wins.
-
-**Fix:** wrap the shared task in `asyncio.shield(...)`, or await
-`asyncio.wait({task}, timeout=...)` and inspect the result instead of letting `wait_for`
-cancel it. The inner timeout should also be strictly shorter than the outer one.
+Because the interceptor is still listening (§3.2), that mid-run refresh works exactly
+like the startup capture.
 
 ---
 
-## 6. Correctness Findings
+## 6. Design Decisions Worth Preserving
 
-### 6.1 `openrouter_api_key` is unresolved in the three status endpoints
+These are the non-obvious choices that make the approach work:
 
-**Severity: Medium.** Scoped to `/`, `/health`, and `/v1/models`. The dialogue path is
-unaffected — `chat_completions` never reads this name — so a running proxy keeps serving
-SkyrimNet normally even while these three endpoints fail.
-
-The module defines `GLOBAL_OPENROUTER_API_KEY` (`proxy.py:123`) but several call sites
-read a *different*, never-assigned name:
-
-| Line | Site |
-|---|---|
-| `proxy.py:760` | `/v1/models` — `if openrouter_api_key:` |
-| `proxy.py:771` | `/health` — `"openrouter_configured": openrouter_api_key is not None` |
-| `proxy.py:781-782` | `/` dashboard — `or_status` / `or_color` |
-
-`openrouter_api_key` only comes into existence when `POST /config/openrouter-key`
-(`proxy.py:735`) executes `global openrouter_api_key` and assigns it.
-
-**Consequence:** on a fresh start, `GET /`, `GET /health`, and `GET /v1/models` return
-500 (`NameError: name 'openrouter_api_key' is not defined`) until a key has been POSTed
-at least once in the process lifetime. The dashboard is a convenience surface, not a
-dependency of the mod, so this is a usability defect rather than a functional one.
-
-**Fix:** delete the second name entirely and use `GLOBAL_OPENROUTER_API_KEY` everywhere,
-with `global GLOBAL_OPENROUTER_API_KEY` in the setter.
-
-### 6.2 A newly saved OpenRouter key is not picked up until restart
-
-**Severity: Medium.** The key *is* persisted correctly, and it *is* loaded correctly on
-the next start — so the OpenRouter feature works, just with a restart in the loop.
-Anthropic models are unaffected.
-
-`chat_completions` reads `GLOBAL_OPENROUTER_API_KEY` (`proxy.py:666`), which is
-populated **only once, at import time**, from `config.json` (`proxy.py:123`). The setter
-writes `config.json` and assigns the *other* variable.
-
-So after saving a key through the dashboard, within that same process:
-
-- the dashboard reports **"Configured (saved)"** (because it reads `openrouter_api_key`),
-- `/health` reports `openrouter_configured: true`,
-- but routing still sees `GLOBAL_OPENROUTER_API_KEY is None` and falls through to the
-  request's `Authorization` header. With no header present, `.removeprefix` is called on
-  `None`, raising `AttributeError`, which is caught (`proxy.py:668`) and reported as
-  **401 "OpenRouter API key not configured"**.
-
-Within that process the user is told the key is saved and simultaneously told it is not
-configured. Restarting resolves it. The same split affects **clearing**: `cfg.pop(...)`
-plus `openrouter_api_key = None` leaves `GLOBAL_OPENROUTER_API_KEY` still holding the
-old key for the life of the process, so a "cleared" key keeps being used until restart.
-
-### 6.3 `except AttributeError` is too broad
-
-At `proxy.py:664-669` the `try` wraps the entire key-resolution expression. It is
-intended to catch "no `Authorization` header, so `.removeprefix` on `None`", but it will
-convert *any* `AttributeError` raised in that expression into a misleading 401. Prefer
-an explicit `request.headers.get("authorization") or ""` and a truthiness check.
-
-### 6.4 `max_tokens` and `temperature` are silently discarded
-
-**Severity: Medium.**
-
-- **`max_tokens` on the Anthropic path.** It is threaded through `chat_completions`
-  (`proxy.py:659`) into `call_api_direct` (`proxy.py:293`) and
-  `call_api_streaming_with_retry` (`proxy.py:357`) — and then never used.
-  `_build_api_body` (`proxy.py:258`) does not set it, so the request always uses whatever
-  value the *captured CLI template* carried. SkyrimNet's configured response length is
-  ignored. (It *is* honored on the OpenRouter path, `proxy.py:501` / `proxy.py:540`.)
-- **`temperature` on both paths.** It is a declared field on `ChatRequest`
-  (`proxy.py:601`), which in Pydantic v2 means it is excluded from `model_extra`.
-  `extra_params` (`proxy.py:660`) is built from `model_extra` only, so `temperature`
-  reaches neither provider. A user tuning temperature for NPC variety gets no effect
-  anywhere.
-
-Note the asymmetry this creates: undeclared extras like `top_p` *do* reach OpenRouter
-(because they land in `model_extra`), while the declared `temperature` does not.
-
-### 6.5 Only the last `system` message survives
-
-The loop at `proxy.py:637-641` assigns rather than accumulates, so a request with
-multiple `system` messages keeps only the final one. OpenAI clients that split
-instructions across several system turns will lose content silently. Joining with
-`\n\n` would match the merge behavior already applied to user/assistant turns.
-
-### 6.6 Empty completions become HTTP 500
-
-`if not response: raise HTTPException(500, "Empty response")` (`proxy.py:679`). A model
-that legitimately returns an empty string — refusal, immediate stop, zero-length turn —
-is reported as a server error. `is None` is the correct test.
-
-### 6.7 Interceptor forwards every method as POST
-
-The route is registered as `"*"` (`proxy.py:244`) but the handler unconditionally calls
-`session.post` (`proxy.py:198`). A `GET` or `OPTIONS` reaching the interceptor is
-replayed upstream as a POST. In practice the CLI only issues POSTs, so this is latent
-rather than active.
-
-### 6.8 Capture never fires if `DEFAULT_MODEL` is set to Haiku
-
-The warmup skip is `if "haiku" in model or "count_tokens" in request.path`
-(`proxy.py:166`). Since `capture_auth` spawns the CLI with `--model DEFAULT_MODEL`
-(`proxy.py:211-212`), setting `DEFAULT_MODEL = "claude-haiku-4-5-20251001"` makes the
-capture request match the skip condition, so nothing is ever captured and startup fails
-on the 60 s timeout with a confusing error. The skip should key on a warmup marker, not
-on the model name.
-
-### 6.9 Template shape is assumed, not validated
-
-`_build_api_body` indexes `body["system"][0]` (`proxy.py:262`) and `body["messages"][0]`
-(`proxy.py:269`). The preflight guard in the interceptor ensures both keys *exist*, but
-not that either list is non-empty. An upstream change to the CLI's request shape
-surfaces as an `IndexError`/`KeyError` on every request rather than a clear diagnostic.
-
-### 6.10 Minor observations
-
-- **Dead branch.** `call_api_direct`'s non-SSE JSON parse (`proxy.py:330-336`) is
-  unreachable — `_build_api_body` always forces `stream: True`.
-- **Token usage is fabricated.** `len(text) // 4` (`proxy.py:682-684`) is a rough
-  characters-per-token guess, not real accounting. Fine for a mod; do not build billing
-  on it.
-- **Round-robin is process-global.** Two concurrent NPCs interleave on the counter, so
-  neither gets a stable model. Acceptable for the stated use case; surprising if not
-  expected.
-- **No multimodal support.** `ChatMessage.content` is typed `str` (`proxy.py:594`), so
-  OpenAI's content-block array form is rejected with a 422 at validation.
-- **`_save_config` is not atomic** (`proxy.py:61`) — a crash mid-write truncates
-  `config.json`. `_load_config` recovers (it catches `JSONDecodeError`) but the key is
-  lost.
-- **Redundant `ensure_ready`.** The streaming generator calls it (`proxy.py:368`) after
-  `chat_completions` already did (`proxy.py:683`); harmless, since a ready cache returns
-  immediately.
-
----
-
-## 7. Security Findings
-
-> The project's own README already flags the Anthropic ToS question, and that
-> disclosure is not re-litigated here. This section covers only the *implementation*
-> risks, which are separate from the licensing question.
-
-### 7.1 The full OAuth token is written to the log at INFO
-
-**Severity: High.**
-
-```python
-logger.info(f"New Auth code: {auth.headers.get('Authorization', 'Error - No Auth Found')}")
-```
-— `proxy.py:197`.
-
-Every capture and every renewal prints the complete `Authorization` header — a live
-bearer token for the user's Claude account — to stdout. That console is routinely
-screenshotted or pasted into issue reports when a mod misbehaves, and `.gitignore`
-already anticipates `*.log` files existing. Log a fingerprint at most (length, or the
-last four characters), or drop the line.
-
-### 7.2 The API is unauthenticated and CORS is fully open
-
-**Severity: High.**
-
-```python
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-```
-— `proxy.py:626`.
-
-`/v1/chat/completions` requires no credential of any kind (the README says so
-explicitly: *"API Key: leave empty"*). Combined with `allow_origins=["*"]`, **any web
-page open in the user's browser** can `fetch("http://127.0.0.1:8000/v1/chat/completions")`
-and both *spend the user's Claude Max quota* and *read the response*. The wildcard is
-what makes the response readable; without it this would be a blind write.
-
-The proxy binds to `127.0.0.1` (`proxy.py:919`), which is the right default and limits
-this to local origins — but "local" includes every browser tab and every other process
-on the machine.
-
-**Mitigations, roughly in order of effort:** restrict `allow_origins` to
-`["http://127.0.0.1:8000", "http://localhost:8000"]`; require a shared secret in
-`Authorization` for `/v1/chat/completions` (SkyrimNet can send one); at minimum protect
-`POST /config/openrouter-key`, which is currently a same-machine, no-credential write.
-
-### 7.3 The interceptor accepts requests from any local caller
-
-**Severity: Medium.** `interceptor_handler` (`proxy.py:149`) accepts any path on
-`127.0.0.1:9999`, copies the caller's headers verbatim (minus `Host`), and replays the
-request to `https://api.anthropic.com{request.path_qs}`, returning the response body.
-Any local process can use it to reach Anthropic with arbitrary paths and headers.
-Because the caller must supply its own credentials, this is an SSRF-shaped egress
-channel rather than direct credential theft — but the listener has no reason to remain
-open to arbitrary clients, and it stays up for the whole process lifetime (§3.2).
-
-### 7.4 `config.json` holds a plaintext key and is not gitignored
-
-**Severity: Medium.** `_save_config` (`proxy.py:61`) writes the OpenRouter API key in
-cleartext to `config.json`, in the **repo directory**
-(`os.path.dirname(os.path.abspath(__file__))`, `proxy.py:49`). `.gitignore` lists
-`.env`, `captured_body.json`, `*.log` — but **not `config.json`**. A contributor who
-runs the proxy from a clone and then commits will publish their OpenRouter key.
-
-**Fix:** add `config.json` to `.gitignore` (one line, do it now), and prefer a
-user-config location such as `%APPDATA%` / `~/.config` over the source tree.
-
-### 7.5 Upstream error bodies are echoed to the caller
-
-`HTTPException(status_code=resp.status, detail=error_text[:200])` (`proxy.py:327`,
-`proxy.py:521`) forwards the provider's raw error text. Upstream errors can quote
-request metadata; truncation to 200 characters limits but does not eliminate the
-exposure.
-
----
-
-## 8. Packaging & Operability
-
-- **`start-proxy.bat` hardcodes someone else's path.**
-  ```bat
-  cd /d "E:\Tools\claude-skyrimnet-proxy"
-  ```
-  This does not work for a user who cloned anywhere else.
-  `cd /d "%~dp0"` is the portable form and is a one-line fix.
-- **No configuration surface.** `DEFAULT_MODEL` (`proxy.py:41`), `INTERCEPTOR_PORT`
-  (`proxy.py:42`), the bind host and port 8000 (`proxy.py:919`) are all module
-  constants. Changing any of them means editing source. Environment variables or
-  `argparse` would cost little.
-- **Port conflicts fail opaquely.** If 9999 is occupied, `site.start()` raises inside
-  `lifespan` and uvicorn reports a startup traceback with no hint that a port is the
-  cause — even though the README's troubleshooting section correctly names it as a
-  likely culprit.
-- **`requirements.txt` is accurate** — `fastapi`, `uvicorn`, `aiohttp`, `pydantic` are
-  all imported and all used. No unpinned surprises beyond the `>=` floors.
-- **No tests.** `.gitignore` excludes `test_*.py` and `capture_*.py`, which suggests
-  testing has been done ad hoc and deliberately kept out of the repo. There is no CI and
-  no automated regression coverage for the SSE translation — the single most
-  format-sensitive part of the codebase.
-- **README drift.** The changelog is dated `2025-02-17` while the git history runs
-  through April 2026, and the dashboard / `/health` behavior it describes is subject to
-  finding 6.1.
-
----
-
-## 9. What Is Genuinely Well Built
-
-It is worth being specific about this, because the design decisions below are not
-accidental:
-
-1. **Single-flight refresh** (`proxy.py:87`) is implemented correctly, including the
-   subtle part — awaiting outside the lock so waiters coalesce instead of serializing.
-2. **Clean-tempdir capture** (`proxy.py:205`) cuts ~15 KB from every single request.
-   Small change, large recurring payoff.
-3. **Retry-before-first-chunk** (`proxy.py:386`) correctly recognizes that a streaming
-   response cannot be un-sent, and confines the retry to the only window where it is
-   safe.
-4. **Buffered line splitting** in the SSE reader (`proxy.py:429-433`) handles chunk
-   boundaries properly, which is the standard bug in hand-rolled SSE parsers.
+1. **Single-flight refresh** (`proxy.py:87`) — including the subtle part, awaiting
+   outside the lock so waiters coalesce instead of serializing.
+2. **Clean-tempdir capture** (`proxy.py:205`) — cuts ~15 KB from every request.
+3. **Retry-before-first-chunk** (`proxy.py:386`) — confines the retry to the only window
+   where it is safe.
+4. **Buffered line splitting** in the SSE reader (`proxy.py:429-433`) — handles chunk
+   boundaries correctly, which is the usual failure mode in hand-rolled SSE parsers.
 5. **Preserving `system[0]` and the `<system-reminder>` blocks** (`proxy.py:262`,
-   `proxy.py:267-274`) is the non-obvious insight that makes the whole approach work at
-   all.
-6. **Tool / thinking / context_management stripping** (`proxy.py:185-187`) is the right
+   `proxy.py:267-274`) — the insight the whole approach depends on.
+6. **Tool / thinking / context_management stripping** (`proxy.py:185-187`) — the right
    latency trade for a real-time game.
+7. **Per-request `deepcopy` of the template** (`proxy.py:259`) — keeps concurrent
+   requests isolated from each other.
 
 ---
 
-## 10. Recommendations, Prioritized
-
-These are improvements to a working system, ordered by value-for-effort. Nothing here
-is a prerequisite for running the proxy.
-
-| # | Priority | Finding | Fix |
-|---|---|---|---|
-| 1 | High | 7.1 — bearer token logged at INFO | Delete or fingerprint the log line (`proxy.py:197`) |
-| 2 | High | 7.4 — key in un-gitignored `config.json` | Add `config.json` to `.gitignore` |
-| 3 | High | 6.1 — status endpoints raise `NameError` | Use one global name throughout |
-| 4 | Medium | 6.2 — saved OpenRouter key needs a restart | Assign the same global the router reads |
-| 5 | Medium | 6.4 — `max_tokens` / `temperature` not forwarded | Set `body["max_tokens"]`; forward `temperature` |
-| 6 | Medium | 7.2 — no auth + CORS `*` on a paid endpoint | Narrow `allow_origins`; add a shared secret |
-| 7 | Medium | 5.1 — one waiter's timeout cancels the shared refresh | `asyncio.shield`; make inner timeout shorter |
-| 8 | Low | 8 — `start-proxy.bat` hardcoded path | `cd /d "%~dp0"` |
-| 9 | Low | 6.5 — multiple system messages collapse to the last | Join with `\n\n` |
-| 10 | Low | 6.6 — empty completion returns 500 | Test `is None` |
-| 11 | Low | 7.3 — interceptor accepts arbitrary local callers | Bind to a random port; restrict to capture paths |
-| 12 | Low | 6.7, 6.8, 6.9, 6.10 | Method passthrough, Haiku skip, template validation, dead branch |
-| 13 | Low | 8 — no config surface, no tests | Env vars for host/port/model; unit tests for SSE translation |
-
----
-
-## Appendix A — End-to-End Request Trace
+## Appendix — End-to-End Request Trace
 
 A streaming Anthropic request, `POST /v1/chat/completions`:
 
@@ -572,26 +276,3 @@ call_api_streaming_with_retry (357)
   v
 SkyrimNet renders the NPC line
 ```
-
----
-
-## Appendix B — Verification Notes
-
-Claims in this document were checked against the source rather than inferred:
-
-- **6.1** — confirmed by an AST walk of module-level `Assign`/`AnnAssign` targets;
-  `openrouter_api_key` is absent from the resulting set.
-- **6.4** — confirmed by `grep -n "max_tokens\|temperature"`: `max_tokens` appears in
-  every Anthropic call signature but never inside `_build_api_body`
-  (`proxy.py:258-289`); `temperature` appears only at its declaration
-  (`proxy.py:601`).
-- **6.2** — confirmed by tracing `GLOBAL_OPENROUTER_API_KEY` (assigned only at
-  `proxy.py:123`, read only at `proxy.py:666`) against `openrouter_api_key` (assigned
-  only at `proxy.py:741` / `proxy.py:746`).
-- **5.1** — follows from documented `asyncio.wait_for` semantics (it cancels the awaited
-  future on timeout) applied to the shared `_refresh_task` at `proxy.py:105`.
-- **7.4** — confirmed by reading `.gitignore`; `config.json` is not listed.
-
-Not verified by execution: the proxy was not started during this audit (doing so would
-consume the user's subscription and spawn the Claude CLI), so runtime behavior is
-derived from static reading plus the AST/grep checks above.
