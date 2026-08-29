@@ -147,6 +147,22 @@ Finally `body["model"]` is overwritten with the requested model and `body["strea
 forced to `True` **on both paths** — the non-streaming endpoint streams internally and
 reassembles the text before returning.
 
+**Claude 5 compatibility.** Because the template is captured from whatever model
+`DEFAULT_MODEL` names, it can carry fields the Claude 5 family rejects. Step 4 of
+`_build_api_body` handles this for models matching `is_claude_5_model()`:
+
+- `temperature` / `top_p` / `top_k` are dropped (removed upstream; each is a 400).
+- `output_config.effort` is set from `CLAUDE_5_EFFORT` (default `"low"`). Thinking is
+  adaptive-on by default on Claude 5, so effort — rather than disabling thinking — is
+  what holds latency down. Disabling thinking outright risks `<thinking>` tags leaking
+  into the text an NPC speaks.
+- A trailing assistant turn gets a `Continue.` user turn appended, because assistant
+  prefills were removed on Claude 5.
+
+The predicate is a regex (`_CLAUDE_5_RE`) matching `claude-<name>-5` plus dated
+snapshots. It deliberately does not match `claude-haiku-4-5`, where the `-5` is a minor
+version. Claude 4 request bodies are built exactly as before.
+
 ### 4.3 Streaming translation (`call_api_streaming_with_retry`, `proxy.py:357`)
 
 The generator bridges Anthropic SSE to OpenAI SSE:

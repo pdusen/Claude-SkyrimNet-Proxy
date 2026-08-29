@@ -18,7 +18,7 @@ SkyrimNet (game) --> POST /v1/chat/completions --> Proxy (port 8000) --> Anthrop
 - **Direct API calls** with cached auth (~2s vs ~9s with subprocess per request)
 - **Persistent TCP/TLS session** reused across all requests
 - **Tool definitions stripped** from template (saves ~60KB per request)
-- **Extended thinking disabled** to minimize latency
+- **Extended thinking disabled** to minimize latency (Claude 5 models use `effort: low` instead — see below)
 - **Clean temp directory capture** minimizes template bloat (~1KB vs ~16KB)
 
 ## Requirements
@@ -69,16 +69,42 @@ Open `http://127.0.0.1:8000` in a browser to see the status dashboard with a qui
 In your SkyrimNet configuration, set:
 - **API Endpoint**: `http://localhost:8000/v1/chat/completions`
 - **API Key**: (leave empty or set any value — not required)
-- **Model**: `claude-sonnet-4-5-20250929` (recommended), `claude-opus-4-6`, or any OpenRouter model
+- **Model**: `claude-sonnet-4-5-20250929` (recommended), `claude-sonnet-5`, `claude-opus-5`, or any OpenRouter model
 
 ### Supported Models
 
 | Model ID | Name | Notes |
 |----------|------|-------|
-| `claude-opus-4-6` | Opus 4.6 | Most capable, highest latency |
+| `claude-fable-5` | Fable 5 | Most capable; highest latency and cost |
+| `claude-opus-5` | Opus 5 | Very capable, 1M context |
+| `claude-sonnet-5` | Sonnet 5 | Claude 5 balance pick |
+| `claude-opus-4-6` | Opus 4.6 | Most capable Claude 4 model |
 | `claude-sonnet-4-5-20250929` | Sonnet 4.5 | Best balance (default) |
 | `claude-haiku-4-5-20251001` | Haiku 4.5 | Fastest, least capable |
 | `provider/model` | OpenRouter | Any model via [OpenRouter](https://openrouter.ai) (requires API key) |
+
+### Claude 5 Models
+
+The Claude 5 family (`claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`) changed the
+request format, so the proxy adjusts the captured request template before sending:
+
+- **Sampling parameters are stripped.** `temperature`, `top_p`, and `top_k` were removed
+  on Claude 5 and now return a 400. The template captured from the Claude CLI can still
+  carry them, so they are dropped for these models.
+- **Effort is set to `low`** instead of disabling thinking. Thinking is adaptive-on by
+  default on Claude 5; `low` effort keeps NPC latency down without turning it off, which
+  can leak `<thinking>` tags into the text an NPC speaks. Change `CLAUDE_5_EFFORT` in
+  `proxy.py` to `medium`/`high` for more deliberate dialogue, or `None` to send no
+  `output_config`.
+- **A trailing assistant turn gets a `Continue.` user turn appended.** Assistant prefills
+  were removed on Claude 5. This mirrors the existing fix-up for conversations that do
+  not start with a user turn.
+
+Claude 4 models are unaffected — their requests are built exactly as before.
+
+Note that these models are slower and more expensive than Sonnet 4.5. For ambient NPC
+chatter, `claude-sonnet-4-5-20250929` or `claude-haiku-4-5-20251001` is still the better
+latency trade; Claude 5 is worth it for major characters or long-running conversations.
 
 ### OpenRouter Support
 
@@ -128,6 +154,15 @@ Each request cycles to the next model in the list. Models containing `/` route t
 - The cached auth has expired. Restart the proxy to re-capture.
 
 ## Changelog
+
+### Claude 5 support
+- Added `claude-fable-5`, `claude-opus-5`, and `claude-sonnet-5`
+- Strip `temperature` / `top_p` / `top_k` for Claude 5 models (removed upstream; now a 400)
+- Set `output_config.effort = "low"` on Claude 5 requests to hold latency down
+- Append a `Continue.` user turn when a Claude 5 conversation ends on an assistant turn
+  (assistant prefills were removed)
+- Model list is now driven by a single `ANTHROPIC_MODELS` catalog in `proxy.py`, shared by
+  `/v1/models` and the dashboard
 
 ### 2025-02-17
 - Added OpenRouter support — use any `provider/model` from [OpenRouter](https://openrouter.ai) (e.g. `openai/gpt-4o`, `google/gemini-2.0-flash-001`)

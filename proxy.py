@@ -17,6 +17,7 @@ Concurrency fix:
 
 import asyncio
 import json
+import re
 import time
 import uuid
 import logging
@@ -40,6 +41,38 @@ logger = logging.getLogger("proxy")
 
 DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 INTERCEPTOR_PORT = 9999
+
+# --- Anthropic model catalog ---
+# Drives /v1/models and the dashboard table. Order is the display order.
+ANTHROPIC_MODELS: "dict[str, tuple[str, str]]" = {
+    "claude-fable-5": ("Fable 5", "Most capable; highest latency and cost"),
+    "claude-opus-5": ("Opus 5", "Very capable, 1M context"),
+    "claude-sonnet-5": ("Sonnet 5", "Claude 5 balance pick"),
+    "claude-opus-4-6": ("Opus 4.6", "Most capable Claude 4 model"),
+    "claude-sonnet-4-5-20250929": ("Sonnet 4.5", "Best balance (default)"),
+    "claude-haiku-4-5-20251001": ("Haiku 4.5", "Fastest, least capable"),
+}
+
+# Matches the Claude 5 family — claude-opus-5, claude-sonnet-5, claude-fable-5,
+# claude-mythos-5, plus any dated snapshot. Deliberately does NOT match
+# claude-haiku-4-5: the "-5" there is a minor version, not the family.
+_CLAUDE_5_RE = re.compile(r"^claude-[a-z]+-5(?:-\d{8})?$")
+
+# These were removed on the Claude 5 family; sending any of them returns 400.
+# The captured Claude Code template can still carry them.
+SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
+
+# Thinking is adaptive-on by default on Claude 5, which costs latency the game
+# cannot absorb. "low" effort keeps turns short without disabling thinking
+# outright — disabling it can leak <thinking> tags into the text an NPC speaks.
+# Set to None to send no output_config at all.
+CLAUDE_5_EFFORT: Optional[str] = "low"
+
+
+def is_claude_5_model(model: str) -> bool:
+    """True for the Claude 5 family (opus/sonnet/fable/mythos 5), false for 4.x."""
+    return bool(_CLAUDE_5_RE.match(model))
+
 
 CLAUDE_PATH = shutil.which("claude")
 if not CLAUDE_PATH:
@@ -287,6 +320,26 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str) ->
     body["model"] = model
     body["stream"] = True
     body.pop("thinking", None)
+
+    # 4. Claude 5 parameter compatibility.
+    #    The template is captured from whatever model DEFAULT_MODEL names, so it
+    #    can carry fields the Claude 5 family rejects outright.
+    if is_claude_5_model(model):
+        for param in SAMPLING_PARAMS:
+            body.pop(param, None)
+
+        # A trailing assistant turn is an assistant prefill, which Claude 5
+        # rejects. Mirror the leading "Continue." fix-up at the other end.
+        if body["messages"] and body["messages"][-1].get("role") == "assistant":
+            body["messages"].append(
+                {"role": "user", "content": [{"type": "text", "text": "Continue."}]}
+            )
+
+        if CLAUDE_5_EFFORT:
+            output_config = dict(body.get("output_config") or {})
+            output_config["effort"] = CLAUDE_5_EFFORT
+            body["output_config"] = output_config
+
     return body
 
 
@@ -753,9 +806,8 @@ async def set_openrouter_key(request: Request):
 @app.get("/v1/models")
 async def list_models():
     data = [
-        {"id": "claude-opus-4-6", "object": "model", "owned_by": "anthropic"},
-        {"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},
-        {"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},
+        {"id": model_id, "object": "model", "owned_by": "anthropic"}
+        for model_id in ANTHROPIC_MODELS
     ]
     if openrouter_api_key:
         data.append({"id": "openrouter/*", "object": "model", "owned_by": "openrouter"})
@@ -781,12 +833,10 @@ async def dashboard():
     or_status = "Configured (saved)" if openrouter_api_key else "Not set"
     or_color = "#4ade80" if openrouter_api_key else "#64748b"
 
-    models = [
-        ("claude-opus-4-6", "Opus 4.6", "Most capable, slowest"),
-        ("claude-sonnet-4-5-20250929", "Sonnet 4.5", "Best balance (default)"),
-        ("claude-haiku-4-5-20251001", "Haiku 4.5", "Fastest, least capable"),
-        ("provider/model", "OpenRouter", "Any model via OpenRouter (requires key)"),
-    ]
+    default_model_name = ANTHROPIC_MODELS.get(DEFAULT_MODEL, (DEFAULT_MODEL, ""))[0]
+
+    models = [(mid, name, desc) for mid, (name, desc) in ANTHROPIC_MODELS.items()]
+    models.append(("provider/model", "OpenRouter", "Any model via OpenRouter (requires key)"))
     model_rows = "".join(
         f'<tr><td style="font-family:monospace;color:#93c5fd">{mid}</td><td>{name}</td><td style="color:#9ca3af">{desc}</td></tr>'
         for mid, name, desc in models
@@ -827,7 +877,7 @@ async def dashboard():
     </div>
     <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-top:12px">
       <div><span class="label">Template</span><br><span class="value">{template_size:,} bytes</span></div>
-      <div><span class="label">Default Model</span><br><span class="value">{DEFAULT_MODEL.split("-")[1].title()} {DEFAULT_MODEL.split("-")[2]}</span></div>
+      <div><span class="label">Default Model</span><br><span class="value">{default_model_name}</span></div>
       <div><span class="label">Claude CLI</span><br><span class="value">{os.path.basename(CLAUDE_PATH)}</span></div>
     </div>
   </div>
